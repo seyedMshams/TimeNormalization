@@ -1,1 +1,455 @@
 import ragas
+# Clinical temporal normalization pipeline focused on medical history in doctor/hospital notes.
+# - Section-aware parsing (HPI / Hospital Course / PMH / Medications, etc.)
+# - Robust regex-based extraction for clinical-relative times (yesterday, last Monday, in 3 days, POD#2, HD#3, C2D14, ranges, etc.)
+# - ISO 8601 resolution using a provided Document Creation Time (DCT)
+# - TIMEX3-style values for durations/sets
+# - Optional FHIR Timing objects for medication frequencies (if you also process 'Medications' section)
+#
+# Dependencies: Only Python stdlib + dateutil (install: pip install python-dateutil)
+# No external NLP models required; you can later swap the 'general' extractor with Duckling/HeidelTime if desired.
+#
+# Usage:
+#   from clinical_time_norm import ClinicalTimeNormalizer
+#   normalizer = ClinicalTimeNormalizer()
+#   spans = normalizer.process_note(text, dct="2025-09-15T11:00:00-04:00", anchors={"surgery_date":"2025-09-10"})
+#   print(json.dumps(spans, indent=2))
+#
+# A demo is included at the bottom that writes JSON to /mnt/data/demo_output.json
+
+import re
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Tuple, Any
+from dateutil import parser as dateparser
+from dateutil.relativedelta import relativedelta
+
+# ------------------------- Utilities -------------------------
+
+WEEKDAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+WEEKDAY2IDX = {d:i for i,d in enumerate(WEEKDAYS)}
+
+def to_datetime(dct_str: str) -> datetime:
+    """Parse ISO-like strings to aware datetime. Falls back to naive local-as-UTC if tz absent."""
+    dt = dateparser.parse(dct_str)
+    if dt.tzinfo is None:
+        # Assume UTC when tz not given
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def fmt_date(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+def sign(x: int) -> int:
+    return (x > 0) - (x < 0)
+
+# ------------------------- Output schema -------------------------
+
+@dataclass
+class Span:
+    text: str
+    start: int
+    end: int
+    type: str               # DATE | TIME | DURATION | SET | MED_FREQUENCY | CLINICAL_REL
+    value_iso: Optional[str] = None      # ISO 8601 absolute date when resolvable
+    value_timex3: Optional[str] = None   # TIMEX3-like (e.g., P5D, XXXX-WXX-1)
+    section: Optional[str] = None
+    anchorTime: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
+    confidence: Optional[float] = None
+
+# ------------------------- Sectionizer -------------------------
+
+SECTION_HEADERS = [
+    r"history of present illness|hpi",
+    r"hospital course",
+    r"past medical history|pmh",
+    r"assessment and plan|a/p|plan",
+    r"medications|meds|home meds",
+    r"allergies",
+    r"physical exam|pe",
+    r"ros|review of systems",
+    r"labs|studies",
+    r"imaging",
+    r"operative note|procedure",
+    r"discharge summary|disposition"
+]
+
+SECTION_RE = re.compile(rf"^\s*(?:({'|'.join(SECTION_HEADERS)}))\s*:\s*$", re.IGNORECASE | re.MULTILINE)
+
+def sectionize(text: str) -> List[Tuple[str, int, int, str]]:
+    """
+    Split text into sections. Returns list of (section_text, start, end, section_name).
+    If no headers detected, returns one section 'UNKNOWN'.
+    """
+    spans = []
+    matches = list(SECTION_RE.finditer(text))
+    if not matches:
+        return [(text, 0, len(text), "UNKNOWN")]
+    # Add sentinel end
+    indices = [m.start() for m in matches] + [len(text)]
+    for i, m in enumerate(matches):
+        start_header = m.start()
+        end_header = m.end()
+        name = m.group(1).lower()
+        body_start = end_header
+        body_end = indices[i+1]
+        spans.append((text[body_start:body_end], body_start, body_end, name))
+    return spans
+
+# ------------------------- Medication frequency to FHIR Timing -------------------------
+
+FREQ_PATTS = [
+    (re.compile(r"\bq\.?\s?d(?:ay)?\.?\b|\bqd\b|\bdaily\b|\bone daily\b", re.I), {"frequency":1,"period":1,"periodUnit":"d"}),
+    (re.compile(r"\bb\.?\s?i\.?\s?d\.?\b|\bbid\b", re.I), {"frequency":2,"period":1,"periodUnit":"d"}),
+    (re.compile(r"\bt\.?\s?i\.?\s?d\.?\b|\btid\b", re.I), {"frequency":3,"period":1,"periodUnit":"d"}),
+    (re.compile(r"\bq\.?\s?i\.?\s?d\.?\b|\bqid\b", re.I), {"frequency":4,"period":1,"periodUnit":"d"}),
+    (re.compile(r"\bqod\b|\bevery other day\b", re.I), {"frequency":1,"period":2,"periodUnit":"d"}),
+    (re.compile(r"\bqhs\b|\bat bedtime\b", re.I), {"when":["HS"]}),
+    (re.compile(r"\bqam\b|\bin the morning\b", re.I), {"when":["MORN"]}),
+    (re.compile(r"\bqpm\b|\bin the evening\b", re.I), {"when":["EVE"]}),
+    (re.compile(r"\bweekly\b|\bevery week\b", re.I), {"frequency":1,"period":1,"periodUnit":"wk"}),
+    (re.compile(r"\bmonthly\b|\bevery month\b", re.I), {"frequency":1,"period":1,"periodUnit":"mo"}),
+    (re.compile(r"\bq(\d{1,2})(?:-(\d{1,2}))?h\b", re.I), None), # handled separately
+]
+
+DOSE_HINT = re.compile(r"\b(?:mg|mcg|g|tablet|tab|caps?|ml|units?)\b", re.I)
+ROUTE_HINT = re.compile(r"\b(?:po|iv|im|sc|subcut|pr|sl|topical|inh|inhaled)\b", re.I)
+
+def extract_med_frequency(line: str) -> Optional[Dict[str, Any]]:
+    line_lower = line.lower()
+    for patt, timing in FREQ_PATTS:
+        m = patt.search(line_lower)
+        if m:
+            if timing is not None:
+                return {"fhir_timing": timing, "match": m.group(0)}
+            # qXh or qX-Yh
+            if patt.pattern.find("q(\\d{1,2})") != -1:
+                lo = int(m.group(1))
+                hi = m.group(2)
+                if hi:
+                    hi = int(hi)
+                    return {"fhir_timing": {"frequency":1,"period":lo,"periodMax":hi,"periodUnit":"h"}, "match": m.group(0)}
+                return {"fhir_timing": {"frequency":1,"period":lo,"periodUnit":"h"}, "match": m.group(0)}
+    return None
+
+# ------------------------- General temporal patterns -------------------------
+
+# Absolute dates (various formats)
+MONTHS = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+ABSOLUTE_DATE_PATTS = [
+    re.compile(rf"\b({MONTHS})\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?\b", re.I),
+    re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b"),
+    re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b"),
+]
+
+# Relative days
+RELATIVE_PATTS = [
+    re.compile(r"\b(day before yesterday)\b", re.I),
+    re.compile(r"\b(yesterday|today|tomorrow)\b", re.I),
+    re.compile(r"\b(in)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b", re.I),
+    re.compile(r"\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+(ago|prior)\b", re.I),
+    re.compile(r"\b(last|this|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I),
+    re.compile(r"\bfor\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b", re.I),
+]
+
+# Clinical shorthand
+CLINICAL_PATTS = [
+    re.compile(r"\bPOD[# ]?(\d+)\b", re.I),
+    re.compile(r"\bHD[# ]?(\d+)\b", re.I),
+    re.compile(r"\bPPD[# ]?(\d+)\b", re.I),
+    re.compile(r"\bC(\d+)D(\d+)\b", re.I),  # Chemo cycle/day
+]
+
+def resolve_absolute(m, text_slice: str, dct: datetime) -> Tuple[str, str]:
+    s = m.group(0)
+    # Try direct parse
+    dt = None
+    try:
+        dt = dateparser.parse(s, default=dct)
+    except Exception:
+        dt = None
+    iso = fmt_date(dt) if dt else None
+    timex = iso if iso else None
+    return iso, timex
+
+def add_units(dt: datetime, n: int, unit: str, forward=True) -> datetime:
+    sign_ = 1 if forward else -1
+    unit = unit.lower()
+    if unit.startswith("day"):
+        return dt + relativedelta(days=sign_*n)
+    if unit.startswith("week"):
+        return dt + relativedelta(weeks=sign_*n)
+    if unit.startswith("month"):
+        return dt + relativedelta(months=sign_*n)
+    if unit.startswith("year"):
+        return dt + relativedelta(years=sign_*n)
+    return dt
+
+def dur_timex(n: int, unit: str) -> str:
+    unit = unit.lower()
+    if unit.startswith("day"):
+        return f"P{n}D"
+    if unit.startswith("week"):
+        return f"P{n}W"
+    if unit.startswith("month"):
+        return f"P{n}M"
+    if unit.startswith("year"):
+        return f"P{n}Y"
+    return f"P{n}D"
+
+def weekday_adjust(dct: datetime, target_wd: int, which: str) -> datetime:
+    current = dct.weekday()  # Monday=0
+    if which == "this":
+        # go to most recent target in the same week (including future)
+        delta = target_wd - current
+        return dct + timedelta(days=delta)
+    if which == "last":
+        # previous week's target
+        delta = (target_wd - current) - 7
+        return dct + timedelta(days=delta)
+    if which == "next":
+        delta = (target_wd - current) + 7
+        return dct + timedelta(days=delta)
+    return dct
+
+def resolve_relative(m, dct: datetime) -> Tuple[Optional[str], Optional[str]]:
+    s = m.group(0)
+    if m.re.pattern.find("day before yesterday") != -1:
+        iso = fmt_date(dct - timedelta(days=2))
+        return iso, iso
+    if m.re.pattern.find("(yesterday|today|tomorrow)") != -1:
+        which = m.group(1).lower()
+        delta = {"yesterday": -1, "today": 0, "tomorrow": 1}[which]
+        iso = fmt_date(dct + timedelta(days=delta))
+        return iso, iso
+    if m.re.pattern.startswith("\\b(in)"):
+        n = int(m.group(2))
+        unit = m.group(3)
+        dt = add_units(dct, n, unit, forward=True)
+        iso = fmt_date(dt)
+        return iso, iso
+    if m.re.pattern.find("ago") != -1 or m.re.pattern.find("prior") != -1:
+        n = int(m.group(1))
+        unit = m.group(2)
+        dt = add_units(dct, n, unit, forward=False)
+        iso = fmt_date(dt)
+        return iso, iso
+    if m.re.pattern.find("(last|this|next)") != -1:
+        which = m.group(1).lower()
+        wd = m.group(2).lower()
+        dt = weekday_adjust(dct, WEEKDAY2IDX[wd], which)
+        iso = fmt_date(dt)
+        return iso, iso
+    if m.re.pattern.find("\\bfor\\s+(\\d+)") != -1:
+        n = int(m.group(1)); unit = m.group(2)
+        # This is a DURATION, not a date. We'll return TIMEX3 duration only.
+        return None, dur_timex(n, unit)
+    return None, None
+
+def resolve_clinical(m, dct: datetime, anchors: Dict[str,str]) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+    s = m.group(0)
+    groups = m.groups()
+    attrs = {}
+    if m.re.pattern.find("POD") != -1:
+        day_num = int(groups[0])
+        attrs["kind"] = "POD"
+        if "surgery_date" in anchors:
+            surgery_dt = to_datetime(anchors["surgery_date"])
+            iso = fmt_date(surgery_dt + timedelta(days=day_num))
+            return iso, iso, attrs
+        return None, f"P{day_num}D", attrs
+    if m.re.pattern.find("HD") != -1:
+        day_num = int(groups[0])
+        attrs["kind"] = "HD"
+        if "admit_date" in anchors:
+            admit_dt = to_datetime(anchors["admit_date"])
+            iso = fmt_date(admit_dt + timedelta(days=day_num))
+            return iso, iso, attrs
+        return None, f"P{day_num}D", attrs
+    if m.re.pattern.find("PPD") != -1:
+        day_num = int(groups[0])
+        attrs["kind"] = "PPD"
+        if "delivery_date" in anchors:
+            delivery_dt = to_datetime(anchors["delivery_date"])
+            iso = fmt_date(delivery_dt + timedelta(days=day_num))
+            return iso, iso, attrs
+        return None, f"P{day_num}D", attrs
+    if m.re.pattern.find("C(\\d+)D(\\d+)") != -1:
+        c = int(groups[0]); d = int(groups[1])
+        attrs["kind"] = "CHEMO_CYCLE_DAY"; attrs["cycle"]=c; attrs["day"]=d
+        # If a cycle1 start anchor exists (c1d1_date), we can compute absolute dates
+        if "c1d1_date" in anchors:
+            start = to_datetime(anchors["c1d1_date"])
+            # naive approach: assume 21-day cycles; user can override logic
+            per_cycle = anchors.get("chemo_cycle_days", 21)
+            dt = start + timedelta(days=(c-1)*per_cycle + (d-1))
+            iso = fmt_date(dt)
+            return iso, iso, attrs
+        return None, None, attrs
+    return None, None, attrs
+
+# ------------------------- Core processor -------------------------
+
+class ClinicalTimeNormalizer:
+    def __init__(self):
+        pass
+
+    def _iter_matches(self, text: str):
+        # Yield (match, kind) where kind in {"ABSOLUTE","RELATIVE","CLINICAL"}
+        for patt in ABSOLUTE_DATE_PATTS:
+            for m in patt.finditer(text):
+                yield m, "ABSOLUTE"
+        for patt in RELATIVE_PATTS:
+            for m in patt.finditer(text):
+                yield m, "RELATIVE"
+        for patt in CLINICAL_PATTS:
+            for m in patt.finditer(text):
+                yield m, "CLINICAL"
+
+    def _is_med_line(self, line: str) -> bool:
+        # Heuristic: line contains a dose unit AND (route OR frequency token)
+        has_dose = bool(DOSE_HINT.search(line))
+        has_route_or_freq = bool(ROUTE_HINT.search(line) or any(p.search(line) for p,_ in FREQ_PATTS))
+        return has_dose and has_route_or_freq
+
+    def process_note(
+        self,
+        text: str,
+        dct: str,
+        anchors: Optional[Dict[str, str]] = None,
+        process_medications: bool = True,
+        focus_sections: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        :param text: clinical note
+        :param dct: Document Creation Time string (ISO preferred)
+        :param anchors: known anchors like {"surgery_date": "2025-09-10", "admit_date": "2025-09-01"}
+        :param process_medications: include medication frequency extraction
+        :param focus_sections: if provided, only process sections whose name contains one of these tokens (e.g., ["hpi","hospital course","pmh"])
+        """
+        dct_dt = to_datetime(dct)
+        anchors = anchors or {}
+        out: List[Span] = []
+        sections = sectionize(text)
+
+        for sec_text, sec_start, sec_end, sec_name in sections:
+            normalized_name = sec_name.lower()
+
+            if focus_sections:
+                if not any(tok in normalized_name for tok in focus_sections):
+                    # Still run medication freq in Medications even if not in focus
+                    if process_medications and "med" in normalized_name:
+                        pass
+                    else:
+                        continue
+
+            # ---- Medication frequencies (optional) ----
+            if process_medications and ("med" in normalized_name or any(x in normalized_name for x in ["home meds","medications"])):
+                # Line by line
+                for mline in re.finditer(r".+", sec_text, re.M):
+                    line = mline.group(0)
+                    if self._is_med_line(line):
+                        freq = extract_med_frequency(line)
+                        if freq:
+                            span = Span(
+                                text=freq["match"],
+                                start=sec_start + mline.start() + line.lower().find(freq["match"].lower()),
+                                end=sec_start + mline.start() + line.lower().find(freq["match"].lower()) + len(freq["match"]),
+                                type="MED_FREQUENCY",
+                                section=sec_name,
+                                anchorTime=dct_dt.isoformat(),
+                                attributes={"fhir_timing": freq["fhir_timing"]},
+                                confidence=0.98
+                            )
+                            out.append(span)
+
+            # ---- General & clinical temporal expressions ----
+            # To avoid medication confusion, skip general extraction on lines that look like medication lines
+            for line_m in re.finditer(r".+", sec_text, re.M):
+                line = line_m.group(0)
+                line_abs_start = sec_start + line_m.start()
+                if self._is_med_line(line):
+                    continue
+
+                for m, kind in self._iter_matches(line):
+                    start = line_abs_start + m.start()
+                    end = line_abs_start + m.end()
+                    txt = m.group(0)
+
+                    if kind == "ABSOLUTE":
+                        iso, timex = resolve_absolute(m, txt, dct_dt)
+                        span = Span(text=txt, start=start, end=end, type="DATE",
+                                    value_iso=iso, value_timex3=timex, section=sec_name,
+                                    anchorTime=dct_dt.isoformat(), confidence=0.9)
+                        out.append(span)
+
+                    elif kind == "RELATIVE":
+                        iso, timex = resolve_relative(m, dct_dt)
+                        stype = "DATE" if iso else "DURATION"
+                        span = Span(text=txt, start=start, end=end, type=stype,
+                                    value_iso=iso, value_timex3=timex, section=sec_name,
+                                    anchorTime=dct_dt.isoformat(), confidence=0.88)
+                        out.append(span)
+
+                    elif kind == "CLINICAL":
+                        iso, timex, attrs = resolve_clinical(m, dct_dt, anchors)
+                        stype = "DATE" if iso else "CLINICAL_REL"
+                        span = Span(text=txt, start=start, end=end, type=stype,
+                                    value_iso=iso, value_timex3=timex, section=sec_name,
+                                    anchorTime=dct_dt.isoformat(), attributes=attrs, confidence=0.9)
+                        out.append(span)
+
+        # Merge overlapping spans (simple greedy by position)
+        out_sorted = sorted(out, key=lambda s: (s.start, -(s.end - s.start)))
+        merged: List[Span] = []
+        for s in out_sorted:
+            if not merged:
+                merged.append(s); continue
+            prev = merged[-1]
+            if s.start <= prev.end:  # overlap
+                # keep the longer span; if equal, prefer with value_iso
+                prev_len = prev.end - prev.start
+                s_len = s.end - s.start
+                choose_s = s_len > prev_len or (s_len == prev_len and (s.value_iso and not prev.value_iso))
+                if choose_s:
+                    merged[-1] = s
+            else:
+                merged.append(s)
+
+        # Convert to list of dicts
+        return [asdict(s) for s in merged]
+
+
+# ------------------------- Demo -------------------------
+
+if __name__ == "__main__":
+    demo_note = """HISTORY OF PRESENT ILLNESS:
+    65M with CAD, s/p CABG on 09/10/2025. Reports chest discomfort since last Monday and dizziness yesterday.
+    Follow-up planned in 2 weeks. Chemo resumed C2D14. On HD#3 after admission.
+    
+    HOSPITAL COURSE:
+    POD#2: Pain improved. Tomorrow he will start ambulation. Discharge likely in 3 days.
+    
+    PAST MEDICAL HISTORY:
+    MI in March 2019. Stroke 5 years ago.
+    
+    MEDICATIONS:
+    Metoprolol 25 mg PO BID
+    Acetaminophen 500 mg PO q4-6h PRN pain
+    Warfarin 5 mg PO qpm
+    Vitamin D 1000 units PO daily
+    """
+    normalizer = ClinicalTimeNormalizer()
+    spans = normalizer.process_note(
+        demo_note,
+        dct="2025-09-15T11:00:00-04:00",
+        anchors={"surgery_date":"2025-09-10", "admit_date":"2025-09-12", "c1d1_date":"2025-08-20", "chemo_cycle_days":21},
+        process_medications=True,
+        focus_sections=["hpi","hospital course","pmh"]  # focus on medical history-ish sections
+    )
+    out_path = "/mnt/data/demo_output.json"
+    with open(out_path, "w") as f:
+        json.dump(spans, f, indent=2)
+    print(f"Wrote demo JSON with {len(spans)} spans to {out_path}")

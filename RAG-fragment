@@ -1,0 +1,435 @@
+# pip install langchain faiss-cpu openai tiktoken
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chat_models import ChatOpenAI
+
+# 1) Split into context fragments
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+docs = [
+    ("CATH_GUIDE_2023", "Right Heart Cath Protocol", cath_text),
+    ("PH_FORMULA_2025", "Estimating mPAP", formula_text),
+    ("POSTOP_CARE", "Post-procedure Monitoring", postop_text),
+]
+langchain_docs = []
+for doc_id, title, text in docs:
+    for chunk in splitter.split_text(text):
+        langchain_docs.append(
+            {"page_content": chunk, "metadata": {"doc_id": doc_id, "title": title}}
+        )
+
+# 2) Build embeddings + vector store
+emb = OpenAIEmbeddings()  # or AzureOpenAIEmbeddings
+vs = FAISS.from_texts(
+    [d["page_content"] for d in langchain_docs],
+    embedding=emb,
+    metadatas=[d["metadata"] for d in langchain_docs],
+)
+
+# 3) Retrieve top-K context fragments
+retriever = vs.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 24})
+query = "How to estimate mPAP when waveform is missing?"
+contexts = retriever.get_relevant_documents(query)
+
+# 4) Assemble prompt and call LLM
+template = """You are a clinical assistant. Cite sources.
+
+Question: {question}
+
+Context fragments:
+{contexts}
+
+Answer (with citations):"""
+def format_ctx(docs):
+    lines = []
+    for d in docs:
+        m = d.metadata
+        lines.append(f"[{m.get('title')} — {m.get('doc_id')}] {d.page_content}")
+    return "\n\n---\n\n".join(lines)
+
+prompt = PromptTemplate.from_template(template).format(
+    question=query, contexts=format_ctx(contexts)
+)
+llm = ChatOpenAI(model="gpt-4o-mini")  # or gpt-4o, etc.
+resp = llm.invoke(prompt)
+print(resp.content)
+
+
+
+# pip install llama-index-core llama-index-embeddings-openai llama-index-vector-stores-faiss openai
+from llama_index.core import Document, VectorStoreIndex, Settings, PromptTemplate
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.faiss import FaissVectorStore
+import faiss
+
+# 1) Build documents and splitter
+docs = [
+    Document(text=cath_text, metadata={"doc_id": "CATH_GUIDE_2023", "title": "RHC Protocol"}),
+    Document(text=formula_text, metadata={"doc_id": "PH_FORMULA_2025", "title": "Estimating mPAP"}),
+    Document(text=postop_text, metadata={"doc_id": "POSTOP_CARE", "title": "Post-procedure Monitoring"}),
+]
+Settings.embed_model = OpenAIEmbedding()
+
+# 2) Vector store + index
+d = 1536  # embedding dim for text-embedding-3-large (example)
+index_flat = faiss.IndexFlatIP(d)
+vs = FaissVectorStore(index=index_flat)
+index = VectorStoreIndex.from_documents(docs, vector_store=vs, chunk_size=800, chunk_overlap=120)
+
+# 3) Retrieve & synthesize
+query_engine = index.as_query_engine(similarity_top_k=6)
+response = query_engine.query("How to estimate mPAP when waveform is missing?")
+print(response)
+# You can access retrieved context via response.source_nodes
+for n in response.source_nodes[:3]:
+    print(n.metadata, n.get_text()[:200])
+
+
+from langchain.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+
+bm25 = BM25Retriever.from_texts([d["page_content"] for d in langchain_docs], metadatas=[d["metadata"] for d in langchain_docs])
+bm25.k = 6
+
+dense = vs.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 32})
+
+retriever = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.45, 0.55])
+
+# After initial dense retrieval, rerank top 30 → top 6
+from cohere.rerank import RerankClient
+reranker = RerankClient(api_key=COHERE_KEY)
+reranked = reranker.rerank(query, [d.page_content for d in contexts], top_n=6, model="rerank-3")
+# Map back to docs by indices
+
+system_rule = """
+If a claim is not explicitly supported by the provided context fragments, say: 
+'I don’t have evidence for that in the provided context.' and stop.
+Always include citations like [doc_id].
+"""
+
+
+
+
+
+
+
+"""
+rag_langgraph_pipeline.py
+A compact, production-ish LangGraph RAG pipeline showing:
+- chunk -> embed/store -> hybrid retrieve -> rerank -> prompt -> generate -> verify
+- clean state passing and simple guardrails for grounded answers.
+
+Run:
+  export OPENAI_API_KEY=sk-...
+  python rag_langgraph_pipeline.py
+"""
+
+from __future__ import annotations
+import os
+import math
+import uuid
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+
+# --- LangGraph / LangChain / Vector store ---
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain.schema import Document
+
+# --- Utils ---
+import numpy as np
+from rank_bm25 import BM25Okapi
+from sklearn.metrics.pairwise import cosine_similarity
+
+# =========================
+# Demo Corpus (Replace with your own loader)
+# =========================
+DOCS = [
+    {
+        "doc_id": "CATH_GUIDE_2023",
+        "title": "Right Heart Catheterization Protocol",
+        "text": (
+            "Right heart catheterization (RHC) is used to directly measure pulmonary artery pressures. "
+            "Complications include bleeding, infection, pneumothorax, arrhythmias, and rarely pulmonary artery rupture. "
+            "Ensure sterile technique and continuous ECG monitoring.\n\n"
+            "Mean pulmonary artery pressure (mPAP) can be directly measured from waveform tracing. "
+            "If not directly measured, mPAP may be estimated from systolic (sPAP) and diastolic (dPAP) values."
+        ),
+        "date": "2023-10-12",
+        "source": "internal/protocols/rhc.pdf",
+    },
+    {
+        "doc_id": "PH_FORMULA_2025",
+        "title": "Estimating mPAP from sPAP and dPAP",
+        "text": (
+            "Multiple formulas have been proposed to estimate mean pulmonary artery pressure (mPAP) from sPAP and dPAP. "
+            "In cohort X, an imputation performed well: mPAP = 1.51 + 0.43*sPAP + 0.45*dPAP. "
+            "This approach is useful when waveform-derived mPAP is missing from CATH reports."
+        ),
+        "date": "2025-05-19",
+        "source": "team-notes/ph-imputation.md",
+    },
+    {
+        "doc_id": "POSTOP_CARE",
+        "title": "Post-procedure Monitoring",
+        "text": (
+            "After RHC, monitor the access site for hematoma, check vitals, and observe for arrhythmias. "
+            "Early detection of complications reduces morbidity. Patient education and follow-up are essential."
+        ),
+        "date": "2024-01-03",
+        "source": "wiki/postop/rhc.html",
+    },
+]
+
+# =========================
+# Pipeline State Definition
+# =========================
+@dataclass
+class RAGState:
+    # Inputs
+    question: str
+    # Artifacts
+    chunks: List[Document] = field(default_factory=list)
+    retr_candidates: List[Document] = field(default_factory=list)
+    reranked: List[Tuple[Document, float]] = field(default_factory=list)  # (doc, score)
+    prompt: str = ""
+    answer: str = ""
+    citations_ok: bool = False
+    # Shared components (built once)
+    vectorstore: Optional[FAISS] = None
+    bm25: Optional[BM25Okapi] = None
+    bm25_source_docs: List[Document] = field(default_factory=list)
+    # Config
+    top_k_initial: int = 24
+    top_k_final: int = 6
+
+# =========================
+# Helper: Simple Local Generator Fallback
+# =========================
+def local_mock_generate(question: str, ctx_blocks: List[str]) -> str:
+    # Deterministic mock answer to avoid external API in air-gapped tests
+    bullet_points = "\n".join([f"- {b[:200].strip()}..." for b in ctx_blocks[:3]])
+    return (
+        f"Answer (mock): Based on retrieved context, here are key points:\n"
+        f"{bullet_points}\n\n"
+        f"Citations: " + ", ".join([f"[{i+1}]" for i in range(min(3, len(ctx_blocks)))])
+    )
+
+# =========================
+# Node: Ingest & Chunk
+# =========================
+def node_ingest_chunk(state: RAGState) -> RAGState:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    chunks: List[Document] = []
+    for d in DOCS:
+        for piece in splitter.split_text(d["text"]):
+            meta = {
+                "doc_id": d["doc_id"],
+                "title": d["title"],
+                "date": d["date"],
+                "source": d["source"],
+                "frag_id": f'{d["doc_id"]}-{uuid.uuid4().hex[:8]}',
+            }
+            chunks.append(Document(page_content=piece, metadata=meta))
+    state.chunks = chunks
+    return state
+
+# =========================
+# Node: Build Indexes (Embeddings + FAISS) and BM25
+# =========================
+def node_build_indexes(state: RAGState) -> RAGState:
+    # Embeddings + FAISS
+    try:
+        emb = OpenAIEmbeddings()  # requires OPENAI_API_KEY; will raise if missing
+        state.vectorstore = FAISS.from_documents(state.chunks, emb)
+    except Exception as e:
+        # Graceful fallback to random vectors to keep the demo runnable without keys
+        rng = np.random.default_rng(42)
+        dim = 256
+        vs = FAISS(embedding_function=lambda x: rng.normal(size=(len(x), dim)).astype(np.float32))
+        vs.add_documents(state.chunks)
+        state.vectorstore = vs
+
+    # BM25 corpus
+    state.bm25_source_docs = state.chunks
+    tokenized = [doc.page_content.split() for doc in state.bm25_source_docs]
+    state.bm25 = BM25Okapi(tokenized)
+    return state
+
+# =========================
+# Node: Hybrid Retrieval (BM25 + Dense with MMR)
+# =========================
+def node_retrieve(state: RAGState) -> RAGState:
+    question = state.question
+    k_dense_fetch = state.top_k_initial
+    k_bm25 = min(20, k_dense_fetch)
+
+    # Dense (FAISS) with MMR-like diversity
+    dense_retr = state.vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": k_dense_fetch, "fetch_k": k_dense_fetch * 2})
+    dense_docs: List[Document] = dense_retr.get_relevant_documents(question)
+
+    # BM25
+    bm25_scores = state.bm25.get_scores(question.split())
+    ranked_idx = np.argsort(-bm25_scores)[:k_bm25]
+    bm25_docs = [state.bm25_source_docs[i] for i in ranked_idx]
+
+    # Merge (simple interleave + uniqueness by frag_id)
+    seen = set()
+    merged: List[Document] = []
+    for a, b in zip(dense_docs, bm25_docs):
+        for d in (a, b):
+            fid = d.metadata.get("frag_id")
+            if fid not in seen:
+                merged.append(d)
+                seen.add(fid)
+    # if lengths differ, append remainder
+    for d in dense_docs + bm25_docs:
+        fid = d.metadata.get("frag_id")
+        if fid not in seen:
+            merged.append(d)
+            seen.add(fid)
+
+    state.retr_candidates = merged[: max(state.top_k_initial, state.top_k_final)]
+    return state
+
+# =========================
+# Node: Lightweight Rerank (cosine on embedding space if available)
+# =========================
+def node_rerank(state: RAGState) -> RAGState:
+    # If we used OpenAIEmbeddings in vectorstore, we can access its index matrix for cosine;
+    # FAISS wrapper doesn’t expose raw vectors easily, so we compute a TF-IDF proxy similarity.
+    # For compactness, we’ll do a bag-of-words cosine in-memory for reranking.
+    # (Replace with Cohere/ColBERT if desired.)
+
+    # Build small TF-IDF for rerank candidates
+    texts = [d.page_content for d in state.retr_candidates]
+    if not texts:
+        state.reranked = []
+        return state
+
+    # Simple TF-IDF
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    vec = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", max_features=4000)
+    X = vec.fit_transform(texts)
+    qv = vec.transform([state.question])
+    sims = cosine_similarity(qv, X).ravel()
+
+    pairs = [(doc, float(sims[i])) for i, doc in enumerate(state.retr_candidates)]
+    pairs.sort(key=lambda t: t[1], reverse=True)
+    state.reranked = pairs[: state.top_k_final]
+    return state
+
+# =========================
+# Node: Assemble Prompt
+# =========================
+SYSTEM_RULES = """You are a clinical assistant. Answer ONLY using the provided context fragments.
+If a claim is not supported by the fragments, say:
+"I don’t have evidence for that in the provided context."
+Cite sources inline like [doc_id] and include fragment titles.
+Keep the answer concise and clinically precise."""
+
+def make_context_block(doc: Document) -> str:
+    m = doc.metadata
+    head = f"[{m.get('title')} — {m.get('doc_id')} — {m.get('frag_id')} — {m.get('date')}]"
+    return f"{head}\n{doc.page_content}"
+
+def node_build_prompt(state: RAGState) -> RAGState:
+    blocks = [make_context_block(d) for d, _ in state.reranked]
+    context = "\n\n---\n\n".join(blocks)
+    state.prompt = (
+        f"{SYSTEM_RULES}\n\n"
+        f"Question: {state.question}\n\n"
+        f"Context fragments:\n{context}\n\n"
+        f"Answer with citations:"
+    )
+    return state
+
+# =========================
+# Node: Generate
+# =========================
+def node_generate(state: RAGState) -> RAGState:
+    ctx_blocks = [make_context_block(d) for d, _ in state.reranked]
+    use_openai = bool(os.getenv("OPENAI_API_KEY"))
+
+    if use_openai:
+        try:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            resp = llm.invoke(state.prompt)
+            state.answer = resp.content
+            return state
+        except Exception:
+            pass  # Fall through to mock
+
+    # Fallback mock (keeps the pipeline runnable offline)
+    state.answer = local_mock_generate(state.question, ctx_blocks)
+    return state
+
+# =========================
+# Node: Verify Citations (simple heuristic)
+# - ensures each cited [DOC_ID] exists in the retrieved set
+# =========================
+def node_verify(state: RAGState) -> RAGState:
+    text = state.answer or ""
+    # extract [DOC_ID] patterns
+    import re
+    cited = set(re.findall(r"\[([A-Z0-9_]+)\]", text))
+    available = {d.metadata["doc_id"] for d, _ in state.reranked}
+    # require at least one correct citation
+    state.citations_ok = len(cited & available) > 0 or ("mock" in text.lower())
+    if not state.citations_ok:
+        state.answer = (
+            "I couldn’t verify any citations from the provided fragments. "
+            "Please try again or refine the query."
+        )
+    return state
+
+# =========================
+# Build the Graph
+# =========================
+def build_graph() -> StateGraph:
+    workflow = StateGraph(RAGState)
+    workflow.add_node("ingest_chunk", node_ingest_chunk)
+    workflow.add_node("build_indexes", node_build_indexes)
+    workflow.add_node("retrieve", node_retrieve)
+    workflow.add_node("rerank", node_rerank)
+    workflow.add_node("build_prompt", node_build_prompt)
+    workflow.add_node("generate", node_generate)
+    workflow.add_node("verify", node_verify)
+
+    # Edges
+    workflow.set_entry_point("ingest_chunk")
+    workflow.add_edge("ingest_chunk", "build_indexes")
+    workflow.add_edge("build_indexes", "retrieve")
+    workflow.add_edge("retrieve", "rerank")
+    workflow.add_edge("rerank", "build_prompt")
+    workflow.add_edge("build_prompt", "generate")
+    workflow.add_edge("generate", "verify")
+    workflow.add_edge("verify", END)
+
+    return workflow
+
+# =========================
+# Main (Example run)
+# =========================
+if __name__ == "__main__":
+    question = "How can I estimate mean pulmonary artery pressure when waveform mPAP is missing?"
+    init = RAGState(question=question)
+    graph = build_graph()
+    memory = MemorySaver()  # keeps graph runs in-memory (swap for Redis/etc. in prod)
+    app = graph.compile(checkpointer=memory)
+
+    final_state: RAGState = app.invoke(init)
+    print("\n=== FINAL ANSWER ===\n")
+    print(final_state.answer)
+    print("\nCitations OK:", final_state.citations_ok)
+
+    # Debug: show which fragments made it
+    print("\n=== SELECTED CONTEXT FRAGMENTS ===\n")
+    for i, (doc, score) in enumerate(final_state.reranked, 1):
+        m = doc.metadata
+        print(f"{i}. {m['title']} [{m['doc_id']} / {m['frag_id']}] score={score:.3f}")

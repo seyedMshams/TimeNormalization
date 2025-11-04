@@ -1,0 +1,301 @@
+"""
+rag_langgraph_azure_resources.py
+
+RAG pipeline with:
+- Chunk -> Embed/Index -> Hybrid Retrieve -> Rerank -> Prompt -> Generate -> Verify
+- Azure OpenAI (embeddings + chat)
+- FAISS/BM25 kept as LangGraph RESOURCES (not in state) to avoid serialization errors
+- MemorySaver checkpointer (requires thread_id)
+
+Run:
+  export AZURE_OPENAI_* and deployment env vars as shown above
+  python rag_langgraph_azure_resources.py
+"""
+
+from __future__ import annotations
+import os, uuid, re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------- LangGraph ----------
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+# ---------- LangChain modern imports ----------
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+from langchain_community.vectorstores import FAISS
+
+# ---------- Retrieval utils ----------
+from rank_bm25 import BM25Okapi
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------- Demo corpus (replace w/ loader) ----------
+DOCS = [
+    {
+        "doc_id": "CATH_GUIDE_2023",
+        "title": "Right Heart Catheterization Protocol",
+        "text": (
+            "Right heart catheterization (RHC) is used to directly measure pulmonary artery pressures. "
+            "Complications include bleeding, infection, pneumothorax, arrhythmias, and rarely pulmonary artery rupture. "
+            "Ensure sterile technique and continuous ECG monitoring.\n\n"
+            "Mean pulmonary artery pressure (mPAP) can be directly measured from waveform tracing. "
+            "If not directly measured, mPAP may be estimated from systolic (sPAP) and diastolic (dPAP) values."
+        ),
+        "date": "2023-10-12",
+        "source": "internal/protocols/rhc.pdf",
+    },
+    {
+        "doc_id": "PH_FORMULA_2025",
+        "title": "Estimating mPAP from sPAP and dPAP",
+        "text": (
+            "Multiple formulas have been proposed to estimate mean pulmonary artery pressure (mPAP) from sPAP and dPAP. "
+            "In cohort X, an imputation performed well: mPAP = 1.51 + 0.43*sPAP + 0.45*dPAP. "
+            "This approach is useful when waveform-derived mPAP is missing from CATH reports."
+        ),
+        "date": "2025-05-19",
+        "source": "team-notes/ph-imputation.md",
+    },
+    {
+        "doc_id": "POSTOP_CARE",
+        "title": "Post-procedure Monitoring",
+        "text": (
+            "After RHC, monitor the access site for hematoma, check vitals, and observe for arrhythmias. "
+            "Early detection of complications reduces morbidity. Patient education and follow-up are essential."
+        ),
+        "date": "2024-01-03",
+        "source": "wiki/postop/rhc.html",
+    },
+]
+
+# ---------- Config helpers ----------
+AZURE = {
+    "endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
+    "api_key": os.getenv("AZURE_OPENAI_API_KEY"),
+    "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+    "emb_deployment": os.getenv("AZURE_EMBEDDINGS_DEPLOYMENT", "text-embedding-3-large"),
+    "chat_deployment": os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4o-mini"),
+}
+USE_AZURE = bool(AZURE["endpoint"] and AZURE["api_key"])
+
+# ---------- RAG State (JSON-serializable only!) ----------
+@dataclass
+class RAGState:
+    question: str
+    # store plain dicts for fragments, NOT Document objects
+    chunks: List[Dict[str, Any]] = field(default_factory=list)
+    retr_candidates: List[Dict[str, Any]] = field(default_factory=list)  # [{"content":..., "meta":...}]
+    reranked: List[Dict[str, Any]] = field(default_factory=list)         # [{"content":..., "meta":..., "score": float}]
+    prompt: str = ""
+    answer: str = ""
+    citations_ok: bool = False
+
+# ---------- System rules / prompt ----------
+SYSTEM_RULES = """You are a clinical assistant. Answer ONLY using the provided context fragments.
+If a claim is not supported by the fragments, say:
+"I don’t have evidence for that in the provided context."
+Cite sources inline like [DOC_ID] and include fragment titles when helpful.
+Be concise and clinically precise."""
+
+def as_block(frag: Dict[str, Any]) -> str:
+    m = frag["meta"]
+    head = f"[{m.get('title')} — {m.get('doc_id')} — {m.get('frag_id')} — {m.get('date')}]"
+    return f"{head}\n{frag['content']}"
+
+# ---------- Nodes ----------
+def node_ingest_chunk(state: RAGState) -> RAGState:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    out: List[Dict[str, Any]] = []
+    for d in DOCS:
+        for piece in splitter.split_text(d["text"]):
+            meta = {
+                "doc_id": d["doc_id"],
+                "title": d["title"],
+                "date": d["date"],
+                "source": d["source"],
+                "frag_id": str(uuid.uuid4())[:8],
+            }
+            out.append({"content": piece, "meta": meta})
+    state.chunks = out
+    return state
+
+def build_vectorstore(docs: List[Dict[str, Any]]) -> FAISS:
+    # Build embedding client
+    if not USE_AZURE:
+        # For offline dev, raise a helpful error
+        raise RuntimeError(
+            "Azure OpenAI env vars not set. Please set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY."
+        )
+    emb = AzureOpenAIEmbeddings(
+        azure_deployment=AZURE["emb_deployment"],
+        azure_endpoint=AZURE["endpoint"],
+        openai_api_key=AZURE["api_key"],
+        openai_api_version=AZURE["api_version"],
+    )
+    # Convert to Document objects for vector store API
+    docs_lc = [Document(page_content=d["content"], metadata=d["meta"]) for d in docs]
+    vs = FAISS.from_documents(docs_lc, emb)
+    return vs
+
+def build_bm25(docs: List[Dict[str, Any]]) -> Tuple[BM25Okapi, List[Dict[str, Any]]]:
+    tokenized = [d["content"].split() for d in docs]
+    return BM25Okapi(tokenized), docs
+
+def node_build_indexes(state: RAGState, *, set_resources, **_) -> RAGState:
+    # Build FAISS + BM25 as RESOURCES
+    vs = build_vectorstore(state.chunks)
+    bm25, bm25_docs = build_bm25(state.chunks)
+    set_resources({"vectorstore": vs, "bm25": bm25, "bm25_docs": bm25_docs})
+    return state
+
+def node_retrieve(state: RAGState, *, vectorstore: FAISS, bm25: BM25Okapi, bm25_docs: List[Dict[str, Any]]) -> RAGState:
+    q = state.question
+    # Dense with MMR
+    dense_retr = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 24, "fetch_k": 48})
+    dense_docs_lc = dense_retr.get_relevant_documents(q)
+    dense = [
+        {"content": d.page_content, "meta": dict(d.metadata)}
+        for d in dense_docs_lc
+    ]
+
+    # BM25
+    scores = bm25.get_scores(q.split())
+    order = scores.argsort()[::-1][:20]  # top 20
+    sparse = [bm25_docs[i] for i in order]
+
+    # Merge interleaving with frag_id uniqueness
+    seen, merged = set(), []
+    for a, b in zip(dense, sparse):
+        for d in (a, b):
+            fid = d["meta"]["frag_id"]
+            if fid not in seen:
+                merged.append(d)
+                seen.add(fid)
+    for d in dense + sparse:
+        fid = d["meta"]["frag_id"]
+        if fid not in seen:
+            merged.append(d); seen.add(fid)
+
+    state.retr_candidates = merged[:24]
+    return state
+
+def node_rerank(state: RAGState) -> RAGState:
+    if not state.retr_candidates:
+        state.reranked = []
+        return state
+    texts = [d["content"] for d in state.retr_candidates]
+    vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english", max_features=4000)
+    X = vec.fit_transform(texts)
+    qv = vec.transform([state.question])
+    sims = cosine_similarity(qv, X).ravel()
+    ranked = sorted(
+        (
+            {"content": state.retr_candidates[i]["content"],
+             "meta": state.retr_candidates[i]["meta"],
+             "score": float(sims[i])}
+            for i in range(len(state.retr_candidates))
+        ),
+        key=lambda x: x["score"],
+        reverse=True
+    )
+    state.reranked = ranked[:6]
+    return state
+
+def node_build_prompt(state: RAGState) -> RAGState:
+    ctx = "\n\n---\n\n".join(as_block(f) for f in state.reranked)
+    state.prompt = (
+        f"{SYSTEM_RULES}\n\n"
+        f"Question: {state.question}\n\n"
+        f"Context fragments:\n{ctx}\n\n"
+        f"Answer with citations:"
+    )
+    return state
+
+def mock_generate(question: str, ctx_blocks: List[str]) -> str:
+    bullets = "\n".join(f"- {b[:200].strip()}..." for b in ctx_blocks[:3])
+    return f"Answer (mock):\n{bullets}\n\nCitations: [MOCK]"
+
+def node_generate(state: RAGState) -> RAGState:
+    ctx_blocks = [as_block(f) for f in state.reranked]
+    if USE_AZURE:
+        try:
+            llm = AzureChatOpenAI(
+                azure_deployment=AZURE["chat_deployment"],
+                azure_endpoint=AZURE["endpoint"],
+                openai_api_key=AZURE["api_key"],
+                openai_api_version=AZURE["api_version"],
+                temperature=0,
+            )
+            resp = llm.invoke(state.prompt)
+            state.answer = resp.content
+            return state
+        except Exception as e:
+            state.answer = f"(Azure error fallback) {e}\n\n" + mock_generate(state.question, ctx_blocks)
+            return state
+    else:
+        state.answer = mock_generate(state.question, ctx_blocks)
+        return state
+
+def node_verify(state: RAGState) -> RAGState:
+    text = state.answer or ""
+    cited = set(re.findall(r"\[([A-Za-z0-9_:-]+)\]", text))
+    available = {f["meta"]["doc_id"] for f in state.reranked}
+    state.citations_ok = bool(cited & available) or "MOCK" in cited or "mock" in text.lower()
+    if not state.citations_ok:
+        state.answer = (
+            "I couldn’t verify citations from the provided fragments. "
+            "Please refine the query or retrieve more context."
+        )
+    return state
+
+# ---------- Build graph ----------
+def build_graph() -> StateGraph:
+    g = StateGraph(RAGState)
+    g.add_node("ingest_chunk", node_ingest_chunk)
+    g.add_node("build_indexes", node_build_indexes)
+    g.add_node("retrieve", node_retrieve)
+    g.add_node("rerank", node_rerank)
+    g.add_node("build_prompt", node_build_prompt)
+    g.add_node("generate", node_generate)
+    g.add_node("verify", node_verify)
+
+    g.set_entry_point("ingest_chunk")
+    g.add_edge("ingest_chunk", "build_indexes")
+    g.add_edge("build_indexes", "retrieve")
+    g.add_edge("retrieve", "rerank")
+    g.add_edge("rerank", "build_prompt")
+    g.add_edge("build_prompt", "generate")
+    g.add_edge("generate", "verify")
+    g.add_edge("verify", END)
+    return g
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    question = "How can I estimate mean pulmonary artery pressure when waveform mPAP is missing?"
+    init_state = RAGState(question=question)
+
+    graph = build_graph()
+
+    # Use MemorySaver (needs thread_id)
+    memory = MemorySaver()
+    app = graph.compile(checkpointer=memory)
+
+    # If you *don’t* need persistence, you can also do:
+    # app = graph.compile()
+
+    # The first node (ingest_chunk) needs no resources; build_indexes will create them and set via set_resources
+    # For invoke with checkpointer, pass thread_id:
+    config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
+
+    # Run
+    final: RAGState = app.invoke(init_state, config=config)
+    print("\n=== FINAL ANSWER ===\n")
+    print(final.answer)
+    print("\nCitations OK:", final.citations_ok)
+
+    print("\n=== SELECTED CONTEXT FRAGMENTS ===\n")
+    for i, f in enumerate(final.reranked, 1):
+        m = f["meta"]
+        print(f"{i}. {m['title']} [{m['doc_id']} / {m['frag_id']}] score={f['score']:.3f}")

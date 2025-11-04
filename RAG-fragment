@@ -433,3 +433,77 @@ if __name__ == "__main__":
     for i, (doc, score) in enumerate(final_state.reranked, 1):
         m = doc.metadata
         print(f"{i}. {m['title']} [{m['doc_id']} / {m['frag_id']}] score={score:.3f}")
+
+
+---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+Cell In[8], line 310
+    307 memory = MemorySaver()  # keeps graph runs in-memory (swap for Redis/etc. in prod)
+    308 app = graph.compile(checkpointer=memory)
+--> 310 final_state: RAGState = app.invoke(init)
+    311 print("\n=== FINAL ANSWER ===\n")
+    312 print(final_state.answer)
+
+File ~/.local/lib/python3.11/site-packages/langgraph/pregel/main.py:3094, in Pregel.invoke(self, input, config, context, stream_mode, print_mode, output_keys, interrupt_before, interrupt_after, durability, **kwargs)
+   3091 chunks: list[dict[str, Any] | Any] = []
+   3092 interrupts: list[Interrupt] = []
+-> 3094 for chunk in self.stream(
+   3095     input,
+   3096     config,
+   3097     context=context,
+   3098     stream_mode=["updates", "values"]
+   3099     if stream_mode == "values"
+   3100     else stream_mode,
+   3101     print_mode=print_mode,
+   3102     output_keys=output_keys,
+   3103     interrupt_before=interrupt_before,
+   3104     interrupt_after=interrupt_after,
+   3105     durability=durability,
+   3106     **kwargs,
+   3107 ):
+   3108     if stream_mode == "values":
+   3109         if len(chunk) == 2:
+
+File ~/.local/lib/python3.11/site-packages/langgraph/pregel/main.py:2551, in Pregel.stream(self, input, config, context, stream_mode, print_mode, output_keys, interrupt_before, interrupt_after, durability, subgraphs, debug, **kwargs)
+   2534 run_manager = callback_manager.on_chain_start(
+   2535     None,
+   2536     input,
+   2537     name=config.get("run_name", self.get_name()),
+   2538     run_id=config.get("run_id"),
+   2539 )
+   2540 try:
+   2541     # assign defaults
+   2542     (
+   2543         stream_modes,
+   2544         output_keys,
+   2545         interrupt_before_,
+   2546         interrupt_after_,
+   2547         checkpointer,
+   2548         store,
+   2549         cache,
+   2550         durability_,
+-> 2551     ) = self._defaults(
+   2552         config,
+   2553         stream_mode=stream_mode,
+   2554         print_mode=print_mode,
+   2555         output_keys=output_keys,
+   2556         interrupt_before=interrupt_before,
+   2557         interrupt_after=interrupt_after,
+   2558         durability=durability,
+   2559     )
+   2560     if checkpointer is None and durability is not None:
+   2561         warnings.warn(
+   2562             "`durability` has no effect when no checkpointer is present.",
+   2563         )
+
+File ~/.local/lib/python3.11/site-packages/langgraph/pregel/main.py:2421, in Pregel._defaults(self, config, stream_mode, print_mode, output_keys, interrupt_before, interrupt_after, durability)
+   2419     checkpointer = self.checkpointer
+   2420 if checkpointer and not config.get(CONF):
+-> 2421     raise ValueError(
+   2422         "Checkpointer requires one or more of the following 'configurable' "
+   2423         "keys: thread_id, checkpoint_ns, checkpoint_id"
+   2424     )
+   2425 if CONFIG_KEY_RUNTIME in config.get(CONF, {}):
+   2426     store: BaseStore | None = config[CONF][CONFIG_KEY_RUNTIME].store
+
+ValueError: Checkpointer requires one or more of the following 'configurable' keys: thread_id, checkpoint_ns, checkpoint_id

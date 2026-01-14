@@ -1,0 +1,182 @@
+from pymongo import MongoClient
+import pandas as pd
+import spacy
+import re
+from typing import List, Dict
+
+# ---------- NLP ----------
+nlp = spacy.load("en_core_web_sm")
+
+# ---------- Validation thresholds ----------
+MIN_TOKENS = 6
+MAX_TOKENS = 80
+
+FORBIDDEN_STARTS = {
+    "and", "but", "or", "so", "because", "while", "although"
+}
+
+FORBIDDEN_ENDINGS = {":", ",", "-", "—"}
+
+SENTENCE_ENDINGS = {".", ";", ")"}
+
+QUOTE_CHARS = {'"', "'", "“", "”", "‘", "’"}
+
+CONTROL_CHARS = {"\t", "\r"}
+
+
+
+def detect_sentence_and_quote_issues(text: str) -> Dict:
+    """
+    Identifies all sentence- and quote-related risks that could
+    break internal serialization or indicate incomplete timeline entries.
+    """
+    issues = []
+
+    if not text or not text.strip():
+        return {"valid": False, "issues": ["empty_text"]}
+
+    s = text.strip()
+    doc = nlp(s)
+    tokens = [t for t in doc if not t.is_space]
+
+    # ---- Quote-related (CRITICAL) ----
+    if '"' in s:
+        issues.append("contains_straight_quote")
+
+    if s.count("“") != s.count("”"):
+        issues.append("unbalanced_smart_double_quote")
+
+    if s.count("‘") != s.count("’"):
+        issues.append("unbalanced_smart_single_quote")
+
+    if "'" in s:
+        issues.append("contains_single_quote_or_apostrophe")
+
+    # ---- Sentence boundary ----
+    if s[-1] not in SENTENCE_ENDINGS:
+        issues.append("invalid_sentence_ending")
+
+    # ---- Structural completeness ----
+    if any(s.lower().startswith(f + " ") for f in FORBIDDEN_STARTS):
+        issues.append("starts_with_conjunction")
+
+    if s[-1] in FORBIDDEN_ENDINGS:
+        issues.append("ends_with_forbidden_character")
+
+    if "..." in s:
+        issues.append("contains_ellipsis")
+
+    # ---- Length sanity ----
+    if len(tokens) < MIN_TOKENS:
+        issues.append("too_short")
+
+    if len(tokens) > MAX_TOKENS:
+        issues.append("too_long")
+
+    # ---- Verb presence (KEY) ----
+    if not any(t.pos_ == "VERB" for t in tokens):
+        issues.append("missing_verb")
+
+    # ---- Bracket balance ----
+    if s.count("(") != s.count(")"):
+        issues.append("unbalanced_parentheses")
+
+    if s.count("[") != s.count("]"):
+        issues.append("unbalanced_brackets")
+
+    # ---- Formatting / hidden junk ----
+    if any(c in s for c in CONTROL_CHARS):
+        issues.append("contains_control_characters")
+
+    if re.match(r"^[-*•]+", s):
+        issues.append("starts_with_bullet")
+
+    if s.isupper() and len(s.split()) < 6:
+        issues.append("looks_like_section_header")
+
+    return {
+        "valid": len(issues) == 0,
+        "issues": issues
+    }
+
+
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "your_db_name"
+COLLECTION_NAME = "medicalSummary"
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
+
+def extract_problematic_timeline_events(limit: int = 0) -> pd.DataFrame:
+    rows = []
+
+    cursor = collection.find(
+        {},
+        {
+            "_id": 1,
+            "disabilityFolderId": 1,
+            "langfuseTraceId": 1,
+            "chapters": 1
+        }
+    )
+
+    if limit:
+        cursor = cursor.limit(limit)
+
+    for doc in cursor:
+        document_id = str(doc.get("_id"))
+        disability_folder_id = doc.get("disabilityFolderId")
+        langfuse_trace_id = doc.get("langfuseTraceId")
+
+        for chapter in doc.get("chapters", []):
+            chapter_id = chapter.get("chapter")
+            timeline = chapter.get("structuredTimeline", {})
+            events = timeline.get("events", [])
+
+            for event in events:
+                short_string = event.get("shortDescription")
+                full_string = (
+                    event.get("eventTextWithoutCitations")
+                    or event.get("fullString")
+                )
+
+                analysis = detect_sentence_and_quote_issues(full_string)
+
+                if not analysis["valid"]:
+                    rows.append({
+                        "document_id": document_id,
+                        "disability_folder_id": disability_folder_id,
+                        "langfuse_trace_id": langfuse_trace_id,
+                        "chapter": chapter_id,
+                        "date": event.get("date"),
+                        "short_string": short_string,
+                        "full_string": full_string,
+                        "has_issue": True,
+                        "issue_types": analysis["issues"],
+                        "has_quote_issue": any("quote" in i for i in analysis["issues"]),
+                        "has_sentence_issue": any(
+                            i in {
+                                "missing_verb",
+                                "too_short",
+                                "too_long",
+                                "invalid_sentence_ending",
+                                "starts_with_conjunction"
+                            }
+                            for i in analysis["issues"]
+                        )
+                    })
+
+    return pd.DataFrame(rows)
+
+
+if __name__ == "__main__":
+    df = extract_problematic_timeline_events(limit=0)
+
+    print(f"Identified {len(df)} problematic timeline events")
+
+    # Save for audit / reporting
+    df.to_csv("timeline_validation_findings.csv", index=False)
+    df.to_parquet("timeline_validation_findings.parquet")
+

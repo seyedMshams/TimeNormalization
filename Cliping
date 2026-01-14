@@ -1,0 +1,189 @@
+def detect_quote_issues(text: str):
+    if not text:
+        return False, []
+
+    issues = []
+
+    if '"' in text:
+        issues.append("straight_quote")
+
+    if text.count("“") != text.count("”"):
+        issues.append("unbalanced_smart_double_quote")
+
+    if text.count("‘") != text.count("’"):
+        issues.append("unbalanced_smart_single_quote")
+
+    if "'" in text:
+        issues.append("apostrophe_or_single_quote")
+
+    return len(issues) > 0, issues
+
+
+from pymongo import MongoClient
+import pandas as pd
+
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "your_db_name"
+COLLECTION_NAME = "medicalSummary"
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
+def extract_quote_problem_cases(limit: int = 0) -> pd.DataFrame:
+    rows = []
+
+    cursor = collection.find(
+        {},
+        {
+            "_id": 1,
+            "disabilityFolderId": 1,
+            "langfuseTraceId": 1,
+            "chapters": 1
+        }
+    )
+
+    if limit:
+        cursor = cursor.limit(limit)
+
+    for doc in cursor:
+        document_id = str(doc.get("_id"))
+        disability_folder_id = doc.get("disabilityFolderId")
+        langfuse_trace_id = doc.get("langfuseTraceId")
+
+        chapters = doc.get("chapters", [])
+
+        for chapter in chapters:
+            chapter_id = chapter.get("chapter")
+            timeline = chapter.get("structuredTimeline", {})
+            events = timeline.get("events", [])
+
+            for event in events:
+                short_string = event.get("shortDescription")
+                full_string = (
+                    event.get("eventTextWithoutCitations")
+                    or event.get("fullString")
+                )
+
+                has_issue, issue_types = detect_quote_issues(full_string)
+
+                if has_issue:
+                    rows.append({
+                        "document_id": document_id,
+                        "disability_folder_id": disability_folder_id,
+                        "langfuse_trace_id": langfuse_trace_id,
+                        "chapter": chapter_id,
+                        "date": event.get("date"),
+                        "short_string": short_string,
+                        "full_string": full_string,
+                        "has_quote_issue": True,
+                        "quote_issue_type": issue_types
+                    })
+
+    return pd.DataFrame(rows)
+
+df = extract_quote_problem_cases(limit=500)
+
+print(f"Found {len(df)} events with quote-related issues")
+df.head()
+
+df.to_parquet("quote_problem_timeline_events.parquet")
+
+import spacy
+nlp = spacy.load("en_core_web_sm")
+
+def detect_sentence_issues(text: str):
+    """
+    Identifies quote-related and sentence-completeness issues.
+    """
+    if not text or not text.strip():
+        return True, ["empty_text"]
+
+    issues = []
+    s = text.strip()
+    doc = nlp(s)
+
+    # ---- Quote checks (CRITICAL) ----
+    if '"' in s:
+        issues.append("straight_quote")
+
+    if s.count("“") != s.count("”"):
+        issues.append("unbalanced_smart_double_quote")
+
+    if s.count("‘") != s.count("’"):
+        issues.append("unbalanced_smart_single_quote")
+
+    # ---- Sentence boundary checks ----
+    if s[-1] not in {".", ";", ")"}:
+        issues.append("invalid_sentence_ending")
+
+    # ---- Length check ----
+    tokens = [t for t in doc if not t.is_space]
+    if len(tokens) < 6:
+        issues.append("too_short")
+    elif len(tokens) > 80:
+        issues.append("too_long")
+
+    # ---- Verb check (key missing piece) ----
+    if not any(t.pos_ == "VERB" for t in tokens):
+        issues.append("missing_verb")
+
+    return len(issues) > 0, issues
+
+import pandas as pd
+from pymongo import MongoClient
+
+def extract_problematic_timeline_events(limit: int = 0) -> pd.DataFrame:
+    rows = []
+
+    cursor = collection.find(
+        {},
+        {
+            "_id": 1,
+            "disabilityFolderId": 1,
+            "langfuseTraceId": 1,
+            "chapters": 1
+        }
+    )
+
+    if limit:
+        cursor = cursor.limit(limit)
+
+    for doc in cursor:
+        document_id = str(doc.get("_id"))
+        disability_folder_id = doc.get("disabilityFolderId")
+        langfuse_trace_id = doc.get("langfuseTraceId")
+
+        for chapter in doc.get("chapters", []):
+            chapter_id = chapter.get("chapter")
+            events = chapter.get("structuredTimeline", {}).get("events", [])
+
+            for event in events:
+                short_string = event.get("shortDescription")
+                full_string = (
+                    event.get("eventTextWithoutCitations")
+                    or event.get("fullString")
+                )
+
+                has_issue, issue_types = detect_sentence_issues(full_string)
+
+                if has_issue:
+                    rows.append({
+                        "document_id": document_id,
+                        "disability_folder_id": disability_folder_id,
+                        "langfuse_trace_id": langfuse_trace_id,
+                        "chapter": chapter_id,
+                        "date": event.get("date"),
+                        "short_string": short_string,
+                        "full_string": full_string,
+                        "has_issue": True,
+                        "issue_types": issue_types,
+                        "has_quote_issue": any("quote" in i for i in issue_types),
+                        "has_sentence_issue": any(
+                            i in {"missing_verb", "too_short", "invalid_sentence_ending"}
+                            for i in issue_types
+                        )
+                    })
+
+    return pd.DataFrame(rows)
+
